@@ -1,4 +1,5 @@
 """DataUpdateCoordinator for Segway Navimow integration."""
+import asyncio
 from datetime import timedelta
 import logging
 import json
@@ -21,9 +22,9 @@ class NavimowDataUpdateCoordinator(DataUpdateCoordinator):
         self.entry = entry
         self.devices = devices
         self._mqtt_client = None
-        self._pending_mqtt_token = None
         self._mqtt_info = None
         self._token_expires_at = 0  # Timestamp when access token expires
+        self._token_lock = asyncio.Lock()
         
         super().__init__(
             hass,
@@ -32,44 +33,52 @@ class NavimowDataUpdateCoordinator(DataUpdateCoordinator):
             update_interval=timedelta(seconds=30),
         )
 
-    async def _async_ensure_valid_token(self) -> None:
-        """Refresh OAuth token only if expired or expiring soon.
-        
-        Checks token expiration timestamp before refreshing to avoid unnecessary
-        API calls. Maintains 10-second buffer before actual expiration.
+    async def _async_ensure_valid_token(self, force: bool = False) -> bool:
+        """Refresh the OAuth token if it is expired, expiring soon, or forced.
+
+        Returns False when no valid token could be obtained.
         """
-        # Check if token is still valid (with 10s buffer)
-        now = time.time()
-        if now < self._token_expires_at - 10:
-            return  # Token still valid, no need to refresh
-        
-        refresh_token = self.entry.data.get("refresh_token")
-        if not refresh_token:
-            return
-        
-        try:
+        token_before_waiting = self.api._token
+        async with self._token_lock:
+            # The polling loop and the MQTT disconnect handler both land here when the
+            # token expires. The one that waited must not refresh again with the
+            # refresh token the other one already used.
+            if self.api._token != token_before_waiting:
+                return True
+
+            # Buffer is longer than the 30s polling interval, so the token is always
+            # renewed by a poll before the server expires it.
+            now = time.time()
+            if not force and now < self._token_expires_at - 60:
+                return True
+
+            refresh_token = self.entry.data.get("refresh_token")
+            if not refresh_token:
+                return False
+
             token_response = await self.api.async_refresh_token(refresh_token)
-            if token_response and "access_token" in token_response:
-                new_access = token_response["access_token"]
-                new_refresh = token_response.get("refresh_token", refresh_token)
-                
-                # Calculate token expiration time
-                expires_in = token_response.get("expires_in", 3600)  # Default 1 hour if not provided
-                self._token_expires_at = now + expires_in
-                
-                self.api._token = new_access
-                
-                self.hass.config_entries.async_update_entry(
-                    self.entry,
-                    data={
-                        **self.entry.data,
-                        "access_token": new_access,
-                        "refresh_token": new_refresh,
-                    },
-                )
-                _LOGGER.debug("OAuth token refreshed (expires in %ds)", expires_in)
-        except Exception as err:
-            _LOGGER.warning("Failed to refresh OAuth token: %s", err)
+            if not isinstance(token_response, dict) or "access_token" not in token_response:
+                _LOGGER.warning("Token refresh rejected: %s", token_response)
+                return False
+
+            new_access = token_response["access_token"]
+            self.api._token = new_access
+            self.hass.config_entries.async_update_entry(
+                self.entry,
+                data={
+                    **self.entry.data,
+                    "access_token": new_access,
+                    "refresh_token": token_response.get("refresh_token", refresh_token),
+                },
+            )
+
+            try:
+                expires_in = int(token_response.get("expires_in", 3600))
+            except (TypeError, ValueError):
+                expires_in = 3600
+            self._token_expires_at = now + expires_in
+            _LOGGER.debug("OAuth token refreshed (expires in %ds)", expires_in)
+            return True
 
     async def _async_refresh_mqtt_credentials_on_disconnect(self) -> None:
         """Refresh MQTT credentials after disconnection.
@@ -129,11 +138,8 @@ class NavimowDataUpdateCoordinator(DataUpdateCoordinator):
         # Proactively refresh token before each update to keep API and MQTT credentials in sync.
         # If only refreshed during HTTP fallback, MQTT would have stale token for extended periods,
         # causing commands to fail with CODE_OAUTH_INFO_ILLEGAL when token eventually expires.
-        try:
-            await self._async_ensure_valid_token()
-        except Exception as err:
-            _LOGGER.warning("Token refresh failed during update: %s", err)
-        
+        await self._async_ensure_valid_token()
+
         device_ids = [d["id"] for d in self.devices]
         
         if not device_ids:
@@ -144,43 +150,32 @@ class NavimowDataUpdateCoordinator(DataUpdateCoordinator):
 
         if isinstance(data, dict) and data.get("error") == "TOKEN_EXPIRED":
             _LOGGER.info("Access token expired, attempting refresh...")
-            
-            refresh_token = self.entry.data.get("refresh_token")
-            if not refresh_token:
-                raise UpdateFailed("Refresh token missing, reconnect the Navimow account")
 
-            token_response = await self.api.async_refresh_token(refresh_token)
-            
-            if token_response and "access_token" in token_response:
-                new_access = token_response["access_token"]
-                new_refresh = token_response.get("refresh_token", refresh_token)
-                
-                _LOGGER.info("New access token obtained successfully")
-
-                self.api._token = new_access
-                
-                self.hass.config_entries.async_update_entry(
-                    self.entry,
-                    data={
-                        **self.entry.data,
-                        "access_token": new_access,
-                        "refresh_token": new_refresh,
-                    },
-                )
-                # Update MQTT WebSocket auth headers to avoid reconnection failures (CODE_OAUTH_INFO_ILLEGAL)
-                # Store new token for MQTT credential refresh on disconnect
-                self._pending_mqtt_token = new_access
-
-                data = await self.api.async_get_all_vehicles_status(device_ids)
-            else:
+            if not await self._async_ensure_valid_token(force=True):
                 _LOGGER.error("Refresh token is invalid or server rejected the request")
                 raise UpdateFailed("Session expired. Please remove and re-add the integration.")
+
+            data = await self.api.async_get_all_vehicles_status(device_ids)
 
         if data is None:
             raise UpdateFailed("Communication error with Navimow servers")
 
         
         return data
+
+    async def async_shutdown(self) -> None:
+        """Stop polling and close the MQTT connection."""
+        await super().async_shutdown()
+        client, self._mqtt_client = self._mqtt_client, None
+        if client is None:
+            return
+        client.on_disconnect = None
+
+        def _stop():
+            client.disconnect()
+            client.loop_stop()
+
+        await self.hass.async_add_executor_job(_stop)
 
     async def async_setup_mqtt(self, mqtt_info):
         """Initialize MQTT connection without blocking the loop."""
@@ -327,4 +322,4 @@ class NavimowDataUpdateCoordinator(DataUpdateCoordinator):
                 _LOGGER.debug("Device '%s' attributes: %s", device_id, list(attributes.keys()))
                 self.data[device_id].update(attributes)
 
-        await self.async_set_updated_data(self.data)
+        self.async_set_updated_data(self.data)
